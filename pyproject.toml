@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "creolecentric-mcp"
-version = "0.1.0"
+version = "0.1.1rc1"
 description = "Stdio MCP proxy for the CreoleCentric remote MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
