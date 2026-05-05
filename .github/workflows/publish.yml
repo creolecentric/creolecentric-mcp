@@ -1,14 +1,14 @@
 name: Publish to PyPI
 
-# Triggers on any annotated tag matching v0.1.0, v1.2.3, etc.
-# To cut a release:
-#   git tag -a v0.1.0 -m "v0.1.0"
-#   git push origin v0.1.0
+# Triggered by any v* tag. The build job classifies the tag as a final
+# release or pre-release using PEP 440, then routes to the right registry:
+#   - final releases (v1.2.3)            → PyPI, gated by the `pypi` environment
+#   - pre-releases   (v1.2.3rc1, a1, b1) → TestPyPI, no gate
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:  # Allow manual runs from the Actions tab.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,6 +17,9 @@ jobs:
   build:
     name: Build sdist and wheel
     runs-on: ubuntu-latest
+    outputs:
+      is_prerelease: ${{ steps.classify.outputs.is_prerelease }}
+      version:       ${{ steps.classify.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -26,21 +29,34 @@ jobs:
           python-version: "3.12"
 
       - name: Install build backend
-        run: python -m pip install --upgrade build
+        run: python -m pip install --upgrade build packaging
 
       - name: Build distributions
         run: python -m build
 
-      - name: Verify package version matches the tag
+      - name: Verify tag matches pyproject.toml and classify pre-release
+        id: classify
         if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG_REF: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
-          tag_version="${GITHUB_REF_NAME#v}"
-          pkg_version="$(python -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
-          if [ "$tag_version" != "$pkg_version" ]; then
-            echo "::error::Tag version ($tag_version) does not match pyproject.toml version ($pkg_version)."
-            exit 1
-          fi
+          python <<'PYEOF'
+          import os, pathlib, sys, tomllib
+          from packaging.version import Version
+
+          tag_str = os.environ["TAG_REF"].lstrip("v")
+          pkg_str = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          tag = Version(tag_str)
+          pkg = Version(pkg_str)
+          if tag != pkg:
+              print(f"::error::Tag version ({tag}) does not match pyproject.toml version ({pkg}).")
+              sys.exit(1)
+          flag = "true" if pkg.is_prerelease else "false"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"version={pkg}\n")
+              fh.write(f"is_prerelease={flag}\n")
+          print(f"Resolved version={pkg}, is_prerelease={flag}")
+          PYEOF
 
       - name: Upload built distributions as workflow artifact
         uses: actions/upload-artifact@v4
@@ -48,12 +64,16 @@ jobs:
           name: dist
           path: dist/
 
-  publish:
-    name: Publish to PyPI
+  publish-pypi:
+    name: Publish to PyPI (production)
     needs: build
+    if: |
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.build.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
-    # Only publish on tag pushes, never on workflow_dispatch from a branch.
-    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: pypi
+      url: https://pypi.org/project/creolecentric-mcp/${{ needs.build.outputs.version }}/
     permissions:
       id-token: write  # Required for PyPI trusted publishing (OIDC).
     steps:
@@ -65,3 +85,27 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-testpypi:
+    name: Publish to TestPyPI (pre-release)
+    needs: build
+    if: |
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.build.outputs.is_prerelease == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/creolecentric-mcp/${{ needs.build.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
